@@ -2,116 +2,87 @@
 
 ## 1.
 
-The current `OrdersService` stores orders in a module-level `const ORDERS: Order[]` array in `orders.service.ts`. This works for a demo but fails in production for several reasons: state is lost on every restart, it cannot be shared across multiple server instances (horizontal scaling breaks), and there is no transactional safety for concurrent writes.
+Right now orders live in a plain array (`const ORDERS: Order[]`) at the top of `orders.service.ts`. That's fine for a quick demo, but it has obvious problems in production — every server restart wipes all data, and if you run two server instances they each have their own copy of the array, so they'll diverge instantly.
 
-**Data access layer changes:**
-- Replace the in-memory array with a proper database — PostgreSQL is a natural fit for a B2B SaaS since orders, garments, customers, and billing all have relational structure. An ORM such as TypeORM or Prisma (both have first-class NestJS support) maps cleanly onto the existing `Order` and `Garment` interfaces, which would become entity classes with `@Entity()` / `@Column()` decorators.
-- Introduce a **Repository pattern** inside `OrdersService`. Instead of `ORDERS.find(...)` the service calls `this.orderRepository.findOne({ where: { id } })`. This keeps database logic out of the controller and makes the service unit-testable by mocking the repository.
-- Add **database indexes** on frequently queried columns (`id`, `customerName`, `createdAt`, `garments.status`) so that listing and filtering thousands of orders stays fast.
-- Use **database transactions** for any multi-step writes (e.g., updating multiple garment statuses atomically) to avoid partial updates on failure.
+The obvious first step is moving to a real database. PostgreSQL makes sense here because orders, garments, customers, and billing are all naturally relational — they reference each other a lot. I'd pair it with TypeORM or Prisma since both integrate cleanly with NestJS. The `Order` and `Garment` interfaces would become proper entity classes, and `OrdersService` would talk to a repository instead of the array directly (`this.orderRepository.findOne(...)` instead of `ORDERS.find(...)`). That also makes the service much easier to test because you can just mock the repository.
 
-**Service design changes:**
-- Add **pagination** (`findAll` should accept `page` and `limit` parameters and return a `{ data, total }` shape) so the endpoint does not load thousands of rows into memory.
-- Add **DTOs with validation** (`class-validator`) on the input side so the service never receives malformed data.
-- Consider a **read/write service split** (CQRS-lite) if read patterns (dashboard queries) differ substantially from write patterns (POS garment updates).
+A few other things that'd need to change: `findAll` should accept pagination params (`page`, `limit`) so we're not loading thousands of rows into memory on every request. We'd also want database-level indexes on things like `status` and `createdAt` since those will be filtered and sorted constantly. And any multi-step writes — like updating several garment statuses at once — should be wrapped in a transaction so a halfway-done update can't corrupt data.
 
 ## 2.
 
-The current pattern in `orders.controller.ts` is:
+The current `getOrder` endpoint returns `{ error: "Order with id X not found" }` with a **200 OK** status when the order doesn't exist. The HTTP status code tells the client "everything's fine" while the body says there's a problem — those two things contradict each other.
+
+The tradeoff of the current approach is that it's slightly easier to write, but it means every client (the React frontend, any future mobile app, monitoring tools) has to parse the body to figure out if the request actually succeeded. That's non-standard and error-prone. It also makes the TypeScript signature messy — `Order | { error: string }` — and any auto-generated API client (from OpenAPI/Swagger) would generate inaccurate types.
+
+The fix is straightforward: throw NestJS's built-in `NotFoundException` instead of returning an error object. It automatically sends a 404, and you get the correct HTTP semantics for free:
 
 ```typescript
-getOrder(@Param('id') id: string): Order | { error: string }
+if (!order) throw new NotFoundException(`Order ${id} not found`);
+return order;
 ```
 
-If the order is not found it returns `{ error: "Order with id X not found" }` with an implicit **200 OK** status.
-
-**Tradeoffs of the current approach:**
-- *Pro:* Simple to implement; callers always get a JSON body.
-- *Con:* Clients must inspect the response body shape to detect an error — they cannot rely on the HTTP status code. This breaks standard REST conventions, confuses API clients, CDNs, and monitoring tools that all use status codes to detect failures.
-- *Con:* The union return type `Order | { error: string }` pollutes the TypeScript signature and makes generated API clients (OpenAPI, etc.) produce inaccurate types.
-- *Con:* There is no consistent error envelope across endpoints, so frontend error handling is ad-hoc.
-
-**Improvements:**
-- Use NestJS's built-in `NotFoundException` (which automatically returns 404) instead of returning an error object:
-  ```typescript
-  if (!order) throw new NotFoundException(`Order ${id} not found`);
-  return order;
-  ```
-- Add a **global exception filter** (`@Catch(HttpException)`) that serialises every error into a consistent shape, e.g. `{ statusCode, message, timestamp, path }`, so all endpoints share one error contract.
-- Document the API with **Swagger / OpenAPI** (`@nestjs/swagger`) so consumers have machine-readable knowledge of possible response shapes.
-- For validation errors (400), use `ValidationPipe` with `class-validator` DTOs rather than manual checks.
+Beyond that, for a real API I'd add a global exception filter that wraps all errors in a consistent shape (`{ statusCode, message, timestamp, path }`), and use `ValidationPipe` with class-validator DTOs to handle bad input (400s) cleanly too.
 
 ## 3.
 
-The current `App.tsx` does a single `fetch('http://localhost:3001/api/orders')` inside a `useEffect` with an empty dependency array. This is fine for a single-screen prototype but becomes unmaintainable as the dashboard grows.
+The current setup — a raw `fetch` call inside `useEffect` in `App.tsx` — works for one API call, but it won't scale well once you add filters, pagination, and multiple endpoints. You'd end up copy-pasting the same loading/error state boilerplate everywhere.
 
-**Structural improvements for a complex dashboard:**
+The first thing I'd do is pull all API calls into a separate file like `src/api/ordersApi.ts` with typed async functions (`fetchOrders()`, `fetchOrderById()`, `fetchStatusSummary()`). No component should ever call `fetch` directly — they just call these functions. That makes it easy to change the base URL or add auth headers in one place, and trivial to mock in tests.
 
-1. **Centralise API calls in a dedicated layer** — move all `fetch` calls into a `src/api/ordersApi.ts` module that exports typed async functions (`fetchOrders`, `fetchOrderById`, `fetchStatusSummary`). Components never call `fetch` directly; they call these functions. This makes mocking in tests trivial and avoids duplicating base URLs and headers.
+After that, I'd bring in React Query (TanStack Query). It handles loading states, caching, background refetching, and deduplication automatically. The `useState<boolean>(false)` + `useState<string | null>(null)` pattern you see in `App.tsx` would need to be repeated for every new API call without it — React Query eliminates all that.
 
-2. **Use a data-fetching library** — React Query (TanStack Query) or SWR handle loading/error state, caching, background refetching, pagination, and deduplication automatically. The current manual `useState<boolean>(false)` / `useState<string | null>(null)` pattern would need to be replicated for every new API call; a library eliminates that boilerplate entirely.
+For filters and pagination, those should be server-side rather than client-side filtering. Pass `status`, `page`, and `limit` as query params to the backend rather than fetching everything and filtering in the browser. That keeps responses small regardless of how many orders exist.
 
-3. **Lift shared state, keep local state local** — `selectedStatus` belongs in `App` (shared between the dropdown and the list). Deeply nested UI state (e.g., an expanded order card) belongs in that component. For cross-cutting state (auth, theme) use React Context or a lightweight store like Zustand.
-
-4. **Paginate and filter server-side** — instead of fetching all orders and filtering in the browser, pass `status`, `page`, and `limit` as query params to the backend. This keeps the payload small regardless of database size.
-
-5. **Extract reusable hooks** — `useOrders(filter)`, `useOrderSummary()` — so that any new page or widget can reuse the data-fetching logic without duplicating it.
+Finally, wrapping each endpoint in a custom hook (`useOrders(filter)`, `useOrderSummary()`) means any new page can reuse the data-fetching logic without duplicating anything.
 
 ## 4.
 
-**Missing fields / edge cases in the current domain model:**
+Looking at the current `Order` and `Garment` types, there are quite a few things missing that would matter in a real laundry business:
 
-| Gap | Why it matters |
-|-----|---------------|
-| No `customerId` / customer contact | Orders are linked to a name string only; impossible to look up a customer's full history or send SMS/email notifications. |
-| No `totalPrice` / `itemPrice` on `Garment` | Billing requires per-garment pricing, discounts, and tax. There is no way to generate an invoice. |
-| No `updatedAt` or status history on `Garment` | Without an audit trail there is no way to know how long a garment sat in `in_cleaning`, which is critical for SLA tracking and disputes. |
-| No `estimatedReadyAt` / `dueDate` on `Order` | POS staff and customers need promised ready times; missed deadlines are a core business risk. |
-| No `paymentStatus` on `Order` | Prepaid packages, partial payments, and outstanding balances are core QDC workflows; a boolean or enum (`unpaid \| paid \| prepaid \| refunded`) is needed. |
-| No `deliveryAddress` / `deliveryMethod` | Pickup vs. home-delivery are fundamentally different workflows with different statuses. |
-| `id` is a plain `string` | Auto-generated IDs (UUIDs or DB sequences) should be set by the persistence layer, not hardcoded strings like `'ORD-1001'`. |
-| `createdAt` is set to `new Date()` at module load | All orders get the same timestamp when the server starts rather than when each order is actually created. |
+There's no `customerId` — orders are tied to a name string, which means you can't look up a customer's history, send them notifications, or link them to a prepaid package account.
 
-**Evolved domain model direction:** Separate `Customer`, `Order`, `Garment`, `Payment`, and `Package` as distinct entities with proper foreign keys. Add a `GarmentStatusHistory` table for audit trails. Use an enum or a separate `DeliveryMethod` entity for delivery types.
+Garments have no price. You can't generate an invoice, handle discounts, or track which items are covered by a prepaid package without some kind of `price` or `packageItemId` field.
+
+There's no status history on garments. If a customer disputes that their shirt was damaged during cleaning, you have no way to know when it moved from `received` to `in_cleaning`, or how long it sat at each stage. A separate status change log (even just `{ status, changedAt }[]`) would be essential.
+
+There's no `estimatedReadyAt` or `dueDate` on the order. POS staff need to be able to promise customers a pickup time, and the business needs to track missed deadlines.
+
+`paymentStatus` is missing entirely — the order model has no way to represent whether it's been paid, is outstanding, is covered by a prepaid package, or has been refunded.
+
+There's also no `deliveryMethod` — pickup and home delivery are different workflows with different statuses and staff actions.
+
+One small bug worth noting: `createdAt: new Date().toISOString()` is evaluated when the module loads, so in the current mock data every order gets the same timestamp. In a real system the database sets this automatically.
 
 ## 5.
 
-AI-generated code in this codebase shows typical patterns: flat in-memory storage without concurrency handling, union return types instead of proper HTTP exceptions, and no input validation. The risks and mitigations are:
+Looking at the code, it has some tell-tale signs of AI generation: in-memory storage with no concurrency handling, union return types instead of HTTP exceptions, no input validation, and `catch (e: any)` in `App.tsx`. These aren't necessarily wrong for a skeleton app, but they'd be risky to ship without review.
 
-**Risks:**
-1. **Silent incorrectness** — AI code often looks plausible but contains subtle bugs (e.g., the `createdAt: new Date().toISOString()` evaluated at module load time, not at order creation time). These pass a quick read but fail in production.
-2. **Missing error and edge-case handling** — `findOne` returns `undefined` silently; the controller returns a 200 with an error body instead of a 404. AI tools rarely generate robust error propagation without explicit prompting.
-3. **Security gaps** — No input validation on route params or bodies. A production endpoint accepting `:id` with no sanitisation is a injection surface.
-4. **Hallucinated APIs** — AI occasionally generates calls to library methods that don't exist or uses deprecated APIs (e.g., wrong NestJS decorator arguments). These break at compile time but can slip through if TypeScript is loose.
-5. **Overfitting to the happy path** — generated code almost always covers the single happy-path scenario; concurrent writes, empty arrays, null values, and network failures are typically not handled.
+The specific risks I'd flag:
 
-**Review and debugging practices:**
-- **Run the TypeScript compiler with strict mode** (`"strict": true` in `tsconfig.json`) as the first gate — it surfaces type mismatches that AI code often introduces.
-- **Write unit tests before trusting the logic** — a test for `getGarmentStatusSummary` with zero orders, one order with zero garments, and mixed statuses would immediately surface edge cases.
-- **Code review checklist** focused on: error paths, auth/auth missing, missing validation, hardcoded values, and side-effects.
-- **Manual API testing with edge inputs** (empty strings, very long IDs, missing fields) before merging.
-- **Add a linter (`eslint` with `@typescript-eslint`)** with rules like `@typescript-eslint/no-explicit-any` to catch the `catch (e: any)` pattern already present in `App.tsx`.
+The `createdAt` bug mentioned above — it looks correct at a glance but is actually wrong. AI-generated code tends to cover the obvious case and miss subtle initialization issues like this.
+
+Error handling is missing or misleading. The controller returns `{ error: ... }` with a 200 status — a client relying on HTTP status codes would silently treat this as a success. The frontend `catch (e: any)` suppresses TypeScript's type safety for the error path.
+
+There's zero input validation. The `:id` route param goes straight into `ORDERS.find(...)` with no sanitisation. In a real DB-backed system that's a potential injection vector.
+
+AI tools also sometimes call methods that don't exist or use deprecated APIs — these often only show up at compile time, and only if TypeScript is configured strictly.
+
+**What I'd do before shipping:**
+- Enable `"strict": true` in `tsconfig.json` — catches a lot of the type-level issues immediately.
+- Write unit tests for edge cases (empty orders, missing garment, concurrent updates) before trusting any business logic.
+- Do a focused code review pass specifically looking for: missing error paths, hardcoded values, missing auth, and any place where `any` is used.
+- Test the API manually with bad inputs (empty string ID, very long strings, missing fields) before merging.
 
 ## 6.
 
-The current architecture is pure REST (request/response). Adding a real-time garment status board requires the server to **push** updates to connected clients. The main options, with tradeoffs:
+The current REST setup is purely request/response — there's no way for the server to tell the client "this garment just became ready" without the client asking first.
 
-**Option 1 — Server-Sent Events (SSE)**
-NestJS supports SSE with `@Sse()` decorator and `EventEmitter`. The server emits an event whenever a garment status changes. The client uses the browser's native `EventSource` API.
-- ✅ Simple, HTTP/1.1 compatible, no extra infrastructure, automatic reconnect built into `EventSource`.
-- ❌ Unidirectional (server → client only), each client holds an open HTTP connection, which limits concurrency under load.
-- Best fit for a read-only status board.
+There are three realistic ways to add near-real-time updates:
 
-**Option 2 — WebSockets**
-Add `@nestjs/websockets` with the `socket.io` adapter. The server emits `garment:status-changed` events to a room; clients subscribe to that room.
-- ✅ Bidirectional, low latency, battle-tested for dashboards.
-- ❌ Stateful connections require sticky sessions or a Redis pub/sub adapter when running multiple server instances. More operational complexity.
-- Best fit if the board also needs client → server interaction (e.g., drag-and-drop status updates).
+**Short-term — polling:** Just add a `setInterval` on the frontend that re-calls `GET /api/orders` every 5–10 seconds. Zero backend changes needed. It's not truly real-time (up to 10s delay), wastes some bandwidth, but it's the fastest thing to ship and works fine for a small team. Good enough as a stopgap.
 
-**Option 3 — Client-side polling**
-Keep REST, add a `setInterval` on the frontend that re-calls `GET /api/orders` every 5–10 seconds.
-- ✅ Zero backend changes, simplest to ship quickly.
-- ❌ Not truly real-time (up to 10 s lag), wastes bandwidth and server resources, does not scale gracefully.
-- Only acceptable as a short-term stopgap.
+**Better — Server-Sent Events (SSE):** NestJS has a `@Sse()` decorator built in. The server emits an event whenever a garment status changes; the browser listens with the native `EventSource` API and reconnects automatically if the connection drops. This is one-directional (server → client only), but that's all a status board needs. It runs over regular HTTP so there's no extra infrastructure, and it's much lower overhead than polling.
 
-**Recommendation for QDC:** Start with **SSE** since the garment board is read-only and the infrastructure is already NestJS+Express. When the app moves to a multi-instance deployment backed by a real database, emit status-change events from the service layer (triggered by DB writes) through an in-process `EventEmitter2`, and later swap to a Redis pub/sub channel if fan-out across instances is needed — without changing the client-facing SSE contract.
+**Full solution — WebSockets:** Add `@nestjs/websockets` with the `socket.io` adapter. Bidirectional, low latency, and well-suited to a dashboard where staff might also drag garments between status columns. The downside is that WebSocket connections are stateful — if you run multiple server instances you need a Redis adapter for pub/sub to fan out events across them. More operational complexity.
+
+For where QDC is right now I'd go with **SSE** — it solves the problem cleanly without any extra infrastructure, and if scaling ever becomes an issue you can layer Redis pub/sub behind it later without changing the client code at all.
