@@ -1,8 +1,9 @@
 import React from 'react';
-import type { Order } from './App';
+import type { Order, GarmentStatusFilter } from './App';
 
 interface Props {
   orders: Order[];
+  selectedStatus: GarmentStatusFilter;
 }
 
 const statusLabel: Record<string, string> = {
@@ -12,14 +13,33 @@ const statusLabel: Record<string, string> = {
   delivered: 'Delivered',
 };
 
-export const OrdersList: React.FC<Props> = ({ orders }) => {
+export const OrdersList: React.FC<Props> = ({ orders, selectedStatus }) => {
   if (orders.length === 0) {
     return <p>No active orders.</p>;
   }
 
+  // Filter garments inside each order; exclude orders that have no matching garments
+  const filteredOrders = orders
+    .map((order) => ({
+      ...order,
+      garments:
+        selectedStatus === 'all'
+          ? order.garments
+          : order.garments.filter((g) => g.status === selectedStatus),
+    }))
+    .filter((order) => order.garments.length > 0);
+
+  if (filteredOrders.length === 0) {
+    return (
+      <p>
+        No garments with status <strong>{statusLabel[selectedStatus] ?? selectedStatus}</strong>.
+      </p>
+    );
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-      {orders.map((order) => (
+      {filteredOrders.map((order) => (
         <div
           key={order.id}
           style={{

@@ -15,7 +15,7 @@ export interface Order {
   garments: Garment[];
 }
 
-// In-memory mock data to simulate a POS-like workflow
+// mock data — just enough to see the app working
 const ORDERS: Order[] = [
   {
     id: 'ORD-1001',
@@ -46,5 +46,16 @@ export class OrdersService {
     return ORDERS.find((o) => o.id === id);
   }
 
-  // NOTE: You will add more methods here in the implementation tasks.
+  // counts garments by status across every order; skips statuses with 0
+  getGarmentStatusSummary(): { [status: string]: number } {
+    const summary: { [status: string]: number } = {};
+
+    for (const order of ORDERS) {
+      for (const garment of order.garments) {
+        summary[garment.status] = (summary[garment.status] ?? 0) + 1;
+      }
+    }
+
+    return summary;
+  }
 }
